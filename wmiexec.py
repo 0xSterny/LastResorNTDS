@@ -385,6 +385,7 @@ if __name__ == '__main__':
     group = parser.add_argument_group('authentication')
 
     group.add_argument('-hashes', action="store", metavar="LMHASH:NTHASH", help='NTLM hashes, format is LMHASH:NTHASH')
+    group.add_argument('-localauth', action="store_true", default=False, help='Use local account authentication')
     group.add_argument('-no-pass', action="store_true", help='don\'t ask for password (useful for -k)')
     group.add_argument('-k', action="store_true",
                        help='Use Kerberos authentication. Grabs credentials from ccache file '
@@ -410,11 +411,16 @@ if __name__ == '__main__':
     # Init the example's logger theme
     logger.init(options.ts)
 
+    domain, username, password, remoteName = parse_target(options.target)
+
     if options.codec is not None:
         CODEC = options.codec
     else:
         if CODEC is None:
             CODEC = 'utf-8'
+
+    if options.localauth:
+        domain = remoteName
 
     if ' '.join(options.command) == ' ' and options.nooutput is True:
         logging.error("-nooutput switch and interactive shell not supported")
