@@ -854,7 +854,56 @@ default difference:
 The main script defaults to `C$`. Forward it explicitly so both tools
 use the same share.
 
-### Bug 4: Unused imports
+### Bug 4: Seven argparse flags are dead code
+
+These flags are defined in argparse but **never referenced** in `main()`.
+They are never forwarded to `wmiexec.py` or `smbexec-shellless.py`. They
+have zero effect at runtime:
+
+| Flag | Defined at | Used in main() | Should forward to |
+|---|---|---|---|
+| `-share` | line 205 | **never** | both exec tools (output share) |
+| `-ts` | line 207 | **never** | both exec tools (timestamp logging) |
+| `-debug` | line 208 | **never** | both exec tools (debug output) |
+| `-shell-type` | line 210 | **never** | both exec tools (cmd/powershell) |
+| `-silent` | line 204 | **never** | smbexec only (suppress banner) |
+| `-unsafe-exec` | line 209 | **never** | smbexec only (continue on net use fail) |
+| `-port` | line 226 | **never** | smbexec only (139/445) |
+
+Every one of these flags exists on one or both exec tools. The user sets
+them and nothing happens. This means:
+
+- `-debug` does not enable debug output on the exec tool.
+- `-shell-type powershell` does not switch to PowerShell.
+- `-port 139` does not connect on port 139.
+- `-unsafe-exec` does not protect against drive-letter conflicts.
+- `-share` does not control where output is read from.
+
+**Fix in Phase 4:** forward every flag to the correct exec tool. The
+`execute_remote()` function must accept all of them. See the updated
+signature and command-building code in the Phase 4 correction below.
+
+**Flags used in main() (confirmed working):**
+
+| Flag | Where used |
+|---|---|
+| `target` | line 244 (parse_target) |
+| `-hashes` | lines 245, 254, 259, 362, 368 |
+| `-keytab` | line 250 |
+| `-no-pass` | line 254 |
+| `-aesKey` | lines 254, 266 |
+| `-target-ip` | line 263 |
+| `-localauth` | line 269 |
+| `-ip` | line 278 |
+| `-sharename` | line 341 (attacker share setup) |
+| `-shareuser` | line 341 |
+| `-sharepassword` | line 341 |
+| `-sharegroup` | line 341 |
+| `-loot-output` | line 389 |
+| `-k` | lines 252, 267 (set internally, never forwarded) |
+| `-dc-ip` | **never** (same bug as Bug 1) |
+
+### Bug 5: Unused imports
 
 These imports in `LastResorNTDS.py` are never used:
 
@@ -954,35 +1003,54 @@ as one process via WMI).
 Add the Kerberos auth fix (Bug 2 above) to Phase 2. Change the validation
 to accept `-k` or `-aesKey` as alternatives to password and hashes.
 
-### Phase 4 correction: full auth forwarding
+### Phase 4 correction: full flag forwarding
 
-The `execute_remote()` function must accept and forward all auth flags,
-not just hashes and password. Updated signature:
+The `execute_remote()` function must accept and forward **all** flags, not
+just hashes and password. Seven flags are currently dead code (Bug 4). All
+must reach the exec tool.
+
+Updated signature:
 
 ```python
 def execute_remote(exec_method, domain, username, password, remote_name,
                    hashes, command, kerberos=False, aes_key=None,
                    dc_ip=None, target_ip=None, port='445', share='C$',
-                   unsafe_exec=False):
+                   unsafe_exec=False, silent=False, debug=False,
+                   ts=False, shell_type='cmd'):
 ```
 
 **For wmiexec, build this command:**
 
+wmiexec supports: `-hashes`, `-k`, `-aesKey`, `-dc-ip`, `-target-ip`,
+`-share`, `-ts`, `-debug`, `-shell-type`, `-codec`, `-keytab`.
+wmiexec does NOT support: `-port`, `-unsafe-exec`, `-silent`.
+
 ```python
 cmd = [sys.executable, os.path.join(cwd, 'wmiexec.py')]
+
+# Auth flags
 if hashes:
     cmd.extend(['-hashes', hashes])
 if kerberos:
     cmd.append('-k')
 if aes_key:
     cmd.extend(['-aesKey', aes_key])
+
+# Connection flags
 if dc_ip:
     cmd.extend(['-dc-ip', dc_ip])
 if target_ip:
     cmd.extend(['-target-ip', target_ip])
 cmd.extend(['-share', share])
 
-# Build target string
+# Behavior flags
+if ts:
+    cmd.append('-ts')
+if debug:
+    cmd.append('-debug')
+cmd.extend(['-shell-type', shell_type])
+
+# Target string
 if hashes or kerberos:
     target_str = f'{domain}/{username}@{remote_name}'
 else:
@@ -994,14 +1062,23 @@ cmd.append(command)
 
 **For smbexec, build this command:**
 
+smbexec supports: `-hashes`, `-k`, `-aesKey`, `-dc-ip`, `-target-ip`,
+`-share`, `-port`, `-ts`, `-debug`, `-shell-type`, `-codec`, `-keytab`,
+`-unsafe-exec`, `-silent`.
+smbexec does NOT support: `-nooutput`, `-silentcommand`, `-com-version`, `-A`.
+
 ```python
 cmd = [sys.executable, os.path.join(cwd, 'smbexec-shellless.py')]
+
+# Auth flags
 if hashes:
     cmd.extend(['-hashes', hashes])
 if kerberos:
     cmd.append('-k')
 if aes_key:
     cmd.extend(['-aesKey', aes_key])
+
+# Connection flags
 if dc_ip:
     cmd.extend(['-dc-ip', dc_ip])
 if target_ip:
@@ -1009,10 +1086,19 @@ if target_ip:
 if port:
     cmd.extend(['-port', port])
 cmd.extend(['-share', share])
+
+# Behavior flags
+if ts:
+    cmd.append('-ts')
+if debug:
+    cmd.append('-debug')
+cmd.extend(['-shell-type', shell_type])
 if unsafe_exec:
     cmd.append('-unsafe-exec')
+if silent:
+    cmd.append('-silent')
 
-# Build target string (same as wmiexec)
+# Target string
 if hashes or kerberos:
     target_str = f'{domain}/{username}@{remote_name}'
 else:
@@ -1021,6 +1107,38 @@ else:
 cmd.append(target_str)
 cmd.append(command)
 ```
+
+**Flag forwarding matrix:**
+
+| Main script flag | wmiexec.py | smbexec-shellless.py |
+|---|---|---|
+| `-hashes` | forward | forward |
+| `-k` | forward | forward |
+| `-aesKey` | forward | forward |
+| `-dc-ip` | forward | forward |
+| `-target-ip` | forward | forward |
+| `-keytab` | N/A (loaded locally, `-k` forwarded) | N/A (loaded locally, `-k` forwarded) |
+| `-share` | forward (default differs: ADMIN$) | forward (default matches: C$) |
+| `-port` | **not supported** | forward |
+| `-ts` | forward | forward |
+| `-debug` | forward | forward |
+| `-shell-type` | forward | forward |
+| `-unsafe-exec` | **not supported** | forward |
+| `-silent` | **not supported** | forward |
+| `-localauth` | N/A (sets domain=remoteName locally) | N/A (sets domain=remoteName locally) |
+| `-no-pass` | N/A (controls password prompt locally) | N/A (controls password prompt locally) |
+
+Notes:
+- `-keytab` is consumed locally by `Keytab.loadKeysFromKeytab()`, which
+  populates `args.aesKey` and sets `args.k = True`. The exec tools receive
+  `-k` and `-aesKey` instead.
+- `-localauth` sets `domain = remoteName` before calling `execute_remote`.
+  No flag forwarding needed.
+- `-no-pass` controls the password prompt in the main script. No flag
+  forwarding needed.
+- `-port` is not supported by wmiexec (DCOM uses its own ports). If the
+  user passes `-port 139 -exec-method wmiexec`, print a warning that
+  wmiexec does not support port selection.
 
 ### Phase 7 correction: cleanup with `-no-cleanup-image`
 
