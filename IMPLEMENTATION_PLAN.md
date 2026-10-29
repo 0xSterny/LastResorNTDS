@@ -1,7 +1,7 @@
 # LastResorNTDS rewrite: implementation plan
 
 **Date:** 2026-10-29
-**Updated:** 2026-10-29 (second pass — verified against source)
+**Updated:** 2026-10-29 (fourth pass — end-to-end execution trace)
 **Status:** Approved, not started
 **Branch:** TBD (create before work begins)
 
@@ -1241,6 +1241,257 @@ DC_FILES = [
 
 ---
 
+## End-to-end execution trace (fourth pass)
+
+Traced every step from argument parsing through cleanup. Verified how
+wmiexec and smbexec handle long-running dd.exe commands. Found seven issues.
+
+### Issue 1 (critical): smbexec does not wait for dd.exe to finish
+
+**wmiexec** has a retry loop in `get_output()` (wmiexec.py line 272-286):
+
+```python
+while True:
+    try:
+        self.__transferClient.getFile(self.__share, self.__output, output_callback)
+        break
+    except Exception as e:
+        if str(e).find('STATUS_SHARING_VIOLATION') >= 0:
+            # Output not finished, let's wait
+            time.sleep(1)
+            pass
+```
+
+When dd.exe runs through cmd.exe, the output file is held open by the
+redirect. wmiexec polls every 1 second on `STATUS_SHARING_VIOLATION` until
+cmd.exe releases the file (dd.exe finished). The 100000-second SMB timeout
+(wmiexec.py line 140) covers transfers that take hours. wmiexec returns
+only after dd.exe completes. The image is fully written when the main
+script regains control.
+
+**smbexec** has NO retry loop in `get_output()` (smbexec-shellless.py line
+194-199):
+
+```python
+self.transferClient.getFile(self.__share, OUTPUT_FILENAME, output_callback)
+self.transferClient.deleteFile(self.__share, OUTPUT_FILENAME)
+```
+
+For long-running dd.exe, three outcomes exist when smbexec tries to read
+the output file:
+
+| Scenario | getFile result | deleteFile result | Outcome |
+|---|---|---|---|
+| File locked for read | VIOLATION, exception | N/A | smbexec exits 1, dd continues |
+| File readable, locked for delete | Reads partial data | VIOLATION, exception | smbexec exits 1, dd continues |
+| File fully shared | Reads partial data | Succeeds | smbexec returns early, dd continues |
+
+All three return control to the main script before dd.exe finishes. The
+image is incomplete.
+
+**Fix:** Add a `wait_for_image()` function in the main script, called
+between the exec return and the mount. This function polls until image.img
+exists and has a stable file size:
+
+```python
+def wait_for_image(image_path, timeout=7200):
+    """Wait for the image file to stop growing. Returns True on success."""
+    start = time.time()
+    prev_size = -1
+    stable_checks = 0
+
+    while time.time() - start < timeout:
+        if not os.path.exists(image_path):
+            print(f'{gold_plus} Waiting for image file to appear...')
+            time.sleep(10)
+            continue
+
+        curr_size = os.path.getsize(image_path)
+        if curr_size == prev_size and curr_size > 0:
+            stable_checks += 1
+            if stable_checks >= 3:  # 30 seconds of stable size
+                return True
+        else:
+            stable_checks = 0
+
+        prev_size = curr_size
+        size_mb = curr_size / (1024 * 1024)
+        print(f'{gold_plus} Image size: {size_mb:.1f} MB ...')
+        time.sleep(10)
+
+    return False
+```
+
+**Behavior by exec method:**
+
+- wmiexec: image is already complete when wmiexec returns. First check
+  finds a stable file. The wait adds 20 seconds of overhead (two 10-second
+  polls to confirm size is stable).
+- smbexec: image is still growing. The wait polls every 10 seconds and
+  prints progress. When dd.exe finishes and the file size stops changing,
+  the wait returns after 30 seconds of stability.
+
+**Call site in main():**
+
+```python
+# After execute_remote returns
+image_path = f'/var/tmp/{share_name}/image.img'
+
+if not wait_for_image(image_path):
+    print(f'{red_minus} Image file did not appear within timeout.')
+    print(f'{red_minus} dd.exe may have failed on the target.')
+    sys.exit(1)
+
+print(f'{green_plus} Image complete: {os.path.getsize(image_path) / (1024**3):.1f} GB')
+```
+
+This replaces the separate image-existence check that was missing. The wait
+function handles both the existence check and the completeness check.
+
+### Issue 2: `hashes` variable is stale after colon fix
+
+Line 245 in the current code:
+
+```python
+hashes = args.hashes
+```
+
+Lines 259-261 fix the hash format on `args.hashes`:
+
+```python
+if args.hashes is not None and args.hashes.find(':') == -1:
+    args.hashes = ':{}'.format(args.hashes)
+```
+
+After this fix, `args.hashes` has the colon prefix (e.g. `:aabbccdd`), but
+the local `hashes` variable still holds the original value (`aabbccdd`).
+
+The current code at line 363 correctly uses `args.hashes`:
+
+```python
+hasheshash = f'-hashes \'{args.hashes}\''
+```
+
+**Fix:** Pass `args.hashes` (not the local `hashes` variable) to
+`execute_remote()`. The function signature uses `hashes` as the parameter
+name, but the caller must pass the corrected value:
+
+```python
+execute_remote(
+    exec_method=args.exec_method,
+    # ...
+    hashes=args.hashes,  # NOT the local 'hashes' variable
+    # ...
+)
+```
+
+### Issue 3: Cleanup step ordering is wrong
+
+The Phase 7 cleanup in the plan deletes the image before detaching the loop
+device. The correct order is:
+
+1. Unmount the volume image
+2. Detach any leaked loop devices
+3. Delete or move the image file
+4. Stop smbd
+5. Restore smb.conf
+6. Delete user and group
+7. Delete the share folder
+
+If the image is deleted while a loop device still references it, the disk
+space is not freed until the loop device is detached. The reverse order
+(detach first, then delete) releases the inode immediately.
+
+### Issue 4: dd.exe copy uses relative path
+
+Line 349 in the current code:
+
+```python
+shutil.copy(file, dd_dir)
+```
+
+`file` is a bare filename (`'dd.exe'`). Python resolves it against
+`os.getcwd()`, not against the script's directory. If the user runs the
+script from a different directory (e.g. `python /opt/tools/LastResorNTDS.py`),
+the copy fails because dd.exe is not in the current working directory.
+
+**Fix:** Use the script's directory (`cwd` defined at line 22):
+
+```python
+shutil.copy(os.path.join(cwd, file), dd_dir)
+```
+
+This is an existing bug. Fix it in Phase 8.
+
+### Issue 5: Keep `import time`
+
+The plan (Phase 8 addition) lists `import time` as unused and says to
+delete it. The `wait_for_image()` function uses `time.time()` and
+`time.sleep()`. Keep the import.
+
+Updated import list to keep:
+
+```python
+import subprocess
+import time              # used by wait_for_image
+import os
+import shutil
+import argparse
+from datetime import datetime
+import random
+import string
+import sys
+import socket
+import errno
+import netifaces as ni
+from impacket.examples.utils import parse_target
+from impacket.krb5.keytab import Keytab
+```
+
+Delete these (unchanged from Phase 8):
+
+```python
+import re
+import logging
+from impacket.examples import logger
+from impacket import version, smbserver
+from impacket.dcerpc.v5 import transport, scmr
+```
+
+### Issue 6: smbexec `-shell-type` flag has no effect
+
+smbexec-shellless.py defines the PowerShell command prefix at line 123:
+
+```python
+self.__pwsh = 'powershell.exe -NoP -NoL -sta -NonI -W Hidden -Exec Bypass -Enc '
+```
+
+But `execute_remote()` never checks the `shell_type` parameter. It always
+uses `self.__shell` (`%COMSPEC% /Q /c`). The `-shell-type powershell` flag
+is accepted but does nothing.
+
+wmiexec.py does honor `-shell-type powershell` (line 289-291).
+
+**Action:** Forward `-shell-type` to both tools (harmless to smbexec). Add
+a note to the README that `-shell-type powershell` works only with wmiexec.
+
+### Issue 7: exec return code not checked
+
+The current code uses `os.system()` and ignores the return code. The new
+code uses `subprocess.run()`. Check the return code and print a warning,
+but do not abort — dd.exe may still be running (smbexec case):
+
+```python
+result = subprocess.run(cmd, ...)
+if result.returncode != 0:
+    print(f'{gold_plus} Exec tool exited with code {result.returncode}')
+    print(f'{gold_plus} dd.exe may still be running. Checking image...')
+```
+
+The `wait_for_image()` function handles the rest.
+
+---
+
 ## Updated requirements list (for README)
 
 - Python 3.6+
@@ -1279,3 +1530,10 @@ Before merging the rewrite, test each case:
 - [ ] Missing optional .LOG file prints a warning and continues
 - [ ] `.LOG1` and `.LOG2` files are collected in DC mode
 - [ ] `.LOG1` and `.LOG2` files are collected in workstation mode
+- [ ] smbexec with long-running dd.exe: wait_for_image waits for completion
+- [ ] wmiexec with long-running dd.exe: wait_for_image passes quickly
+- [ ] Image file missing after exec failure: clear error, clean exit
+- [ ] Exec tool non-zero exit code prints warning, continues to wait
+- [ ] dd.exe/DLL copy works when script is run from a different directory
+- [ ] Hashes with no colon prefix are fixed before forwarding to exec tool
+- [ ] Cleanup order: unmount → detach loop → delete image → stop smbd
